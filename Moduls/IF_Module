@@ -1,0 +1,326 @@
+/**
+ * IF_Module – Main module for calculating the Invasion Factor (IF).
+ *
+ * Integrates SHAPExtraction, ParameterButonom, FeatureExtene to compute a calibrated invasion
+ * score based on SHAP values, morphological parameters, interactions, and a dynamic sigmoid model.
+ *
+ * Key Functions:
+ * - Prompts user for time (0–143h).
+ * - Extracts morphology via ONNX (ParameterButonom) and CNN features (FeatureExtene).
+ * - Loads SHAP values for Model-A, Model-B, and interaction terms.
+ * - Computes raw IF via weighted SHAP × parameter metric.
+ * - Applies group- and time-specific sigmoid calibration (groups A, D, E).
+ *
+ * Sigmoid Calibration (Supplementary Methods, Fig. S7/Table S3):
+ * - Bayesian inference (PyMC): 4 global params b0,b1,k,x0 ~ Normal(0,1), σ ~ HalfNormal(0,0.03).
+ * - Student-T likelihood (ν=8) for outlier robustness.
+ * - Δ-matrix for 3 groups × n_time to capture temporal/group biases.
+ * - Experimentel E-group was used to simulate high-invasion controls.
+ * - Weight w_A = 80: A-group is treated as calibration gold standard to anchor
+ * - Convergence checked via R-hat (<1.05).
+ *
+ * Output:
+ * - Calibrated IF displayed in an ImageJ ResultsTable
+ *
+ * JSON Model Source:
+ * - sigmoid_global_v11.2.json 
+ *
+ * Dependencies:
+ * - ParameterButonom, FeatureExtene, SHAPExtraction, sigmoid_global_v11.2.json.
+ */
+
+package org.ImplantoMetrics;
+
+import ij.IJ;
+import ij.measure.ResultsTable;
+import ij.plugin.PlugIn;
+
+import javax.swing.JOptionPane;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+import com.google.gson.*;
+
+/**
+ * Berechnet den kalibrierten Invasion‑Faktor.
+ *
+ *  •  Batch → setNextTime(h)     Übergibt die aktuelle Zeit ohne Dialog
+ *  •  Batch ← getLastIF()        Liefert den zuletzt berechneten IF‑Wert
+ */
+@SuppressWarnings("unused")
+public class IF_module_48 implements PlugIn {
+
+    /* ===============================================================
+       (1) – Mailbox‑Schnittstelle für den Batch‑Runner
+       ============================================================== */
+    private static volatile Integer nextTime = null;          // einmaliger Puffer
+
+    /** Wird vor .run("") vom Batch‑Runner aufgerufen */
+    public static void setNextTime(int t){ nextTime = t; }
+
+    /* -------- letzter IF‑Wert für den Batch ----------------------- */
+    private static volatile double lastIF = Double.NaN;
+    public  static double getLastIF() { return lastIF; }
+
+    /* -------- Instanz‑Status ------------------------------------- */
+    private final List<Double> rawIFHistory = new ArrayList<>();
+    private final Map<String,Double> paramVals   = new HashMap<>();
+    private final Map<String,Double> featureVals = new HashMap<>();
+    private String classification = "A";
+
+    /* ===============================================================
+                           ENTRY‑POINT
+       ============================================================== */
+    @Override public void run(String arg) {
+
+        int timeH = askTime();                       // jetzt dialog‑frei möglich
+
+        /* -------- Mess‑ & Modellwerte einlesen -------------------- */
+        readParameters();
+        readFeatures();
+        SHAPExtraction shap = readSHAP(timeH);
+
+        double rawIF = calculateImplantationFactor(
+                shap.getExtractedSHAPValuesWithName()
+                        .values().stream().mapToDouble(Double::doubleValue).toArray(),
+                extractMeasuredParams(),
+                extractInteractionValues(
+                        shap.getExtractedSHAPValuesWithName(),
+                        Math.max(featureVals.size(), 1)
+                ),
+                featureVals.values().stream().mapToDouble(Double::doubleValue).toArray(),
+                timeH
+        );
+
+        /* -------- zeitlicher Verlauf / Klassifikation ------------- */
+        rawIFHistory.add(rawIF);
+        if (rawIFHistory.size() >= 4) {
+            double s0 = rawIFHistory.get(rawIFHistory.size()-4);
+            double s3 = rawIFHistory.get(rawIFHistory.size()-1);
+            double slope = (s3 - s0) / 3.0;
+            classification = slope < 0 ? "D" : "E";
+        } else { classification = "A"; }
+
+        /* -------- Kalibrieren ------------------------------------ */
+        double calIF = TimeSigmoidCalibrator.apply(rawIF, timeH, classification);
+        lastIF = calIF;                                   // ★ für Batch
+
+        /* -------- Ausgabe ---------------------------------------- */
+        ResultsTable rt = new ResultsTable();
+        rt.incrementCounter();
+        rt.addValue("Time_h",          timeH);
+        rt.addValue("Invasion Factor", calIF);
+        rt.show("Results");
+    }
+
+    /* ===============================================================
+         (2) – Zeitwert holen (mit Mailbox‑Bypass)
+       ============================================================== */
+    private int askTime() {
+
+        /* → Wert vom Batch? */
+        if (nextTime != null){
+            int t = nextTime;
+            nextTime = null;               // verbrauchen
+            return t;
+        }
+
+        /* → Dialog zeigen */
+        String in = JOptionPane.showInputDialog(
+                "Please enter Time [h] (0–143):");
+        try{
+            int t = Integer.parseInt(in);
+            if (t>=0 && t<=143) return t;
+        }catch(Exception ignored){}
+        JOptionPane.showMessageDialog(null,
+                "Value must be an integer between 0 and 143.",
+                "Error", JOptionPane.ERROR_MESSAGE);
+        throw new RuntimeException("invalid time input");
+    }
+
+    /* ===============================================================
+            (3) – Parameter‑ & Feature‑Handling (wie zuvor)
+       ============================================================== */
+    private String normalize(String s){
+        if (s==null) return "";
+        s = s.trim().toLowerCase();
+        switch(s){
+            case "cell radius": case "radius": case "spheroid size":
+                return "spheroid radius";
+            case "area": case "spheroid area": case "cell area":
+                return "total spheroid and cell projections area";
+            case "migration radius": case "invasion radius":
+            case "migration/invasion radius":
+                return "the migration/invasion radius";
+            case "distribution of migration":
+            case "distribution of invasion":
+                return "the distribution of migration/invasion";
+            case "number of projections": case "projection count":
+            case "cell projections":
+                return "the number of cell projections";
+            default: return s;
+        }
+    }
+    private void readParameters(){
+        paramVals.clear();
+        new ParameterButonom().run("");
+        ParameterButonom.getLastResults()
+                .forEach((k,v)-> paramVals.put(normalize(k), (double)v));
+    }
+    private void readFeatures(){
+        featureVals.clear();
+        try{
+            FeatureExtene f = new FeatureExtene(); f.run("");
+            Map<String,Double> ext = f.getExtractedFeaturesWithName();
+            if (ext!=null) featureVals.putAll(ext);
+        }catch(Exception e){ IJ.log("Feature extraction failed: "+e); }
+    }
+    private SHAPExtraction readSHAP(int t){
+        SHAPExtraction s = new SHAPExtraction(); s.setTime(t); s.run(""); return s;
+    }
+    private double[] extractMeasuredParams(){
+        List<String> keys = Arrays.asList(
+                "spheroid radius",
+                "total spheroid and cell projections area",
+                "the migration/invasion radius",
+                "the number of cell projections"
+        );
+        return paramVals.entrySet().stream()
+                .filter(e -> keys.contains(e.getKey()))
+                .mapToDouble(Map.Entry::getValue).toArray();
+    }
+
+    /* -------- Interaction‑Matrix aus SHAP‑Namen ------------------ */
+    private Map<String,Integer> createIdx(){
+        String[] n = {
+                "spheroid radius",
+                "total spheroid and cell projections area",
+                "the migration/invasion radius",
+                "the number of cell projections",
+                "circularity"
+        };
+        Map<String,Integer> map = new HashMap<>();
+        for(int i=0;i<n.length;i++) map.put(n[i], i);
+        return map;
+    }
+    private double[][] extractInteractionValues(Map<String,Double> shap,int featCnt){
+        double[][] mat = new double[featCnt][featCnt];
+        Map<String,Integer> idx = createIdx();
+        for(Map.Entry<String,Double> e : shap.entrySet()){
+            String k = e.getKey();
+            if (!k.contains("-Feature_")) continue;
+            String[] p = k.split("-Feature_");
+            if (p.length!=2) continue;
+            Integer i = idx.get(normalize(p[0]));
+            int j; try{ j=Integer.parseInt(p[1])-1; }catch(Exception ex){ continue; }
+            if (i!=null && j<featCnt) mat[i][j] = mat[j][i] = e.getValue();
+        }
+        return mat;
+    }
+
+    /* -------- Roh‑IF‑Berechnung --------------------------------- */
+    private double calculateImplantationFactor(
+            double[] shapValues, double[] measuredParams,
+            double[][] interactionValues, double[] selectedFeatures,
+            int currentInterval
+    ){
+        double num=0, den=0;
+        double max = Math.max(Arrays.stream(shapValues)
+                .map(Math::abs).max().orElse(1.0), 1e-3);
+        double w = 2.0;
+        for(int i=0;i<measuredParams.length;i++){
+            double raw  = shapValues[i];
+            double norm = Math.max(Math.abs(raw)/max,1e-3);
+            double amp  = w*Math.pow(norm,2);
+            double sign = raw>=0 ? 1 : -1;
+            num += sign*amp*measuredParams[i];
+            den += Math.pow(measuredParams[i],2)+Math.pow(amp,2);
+        }
+        return num/Math.sqrt(Math.max(den,1e-9));
+    }
+
+    /* ===============================================================
+            (4) – Sigmoid‑Kalibrator (gleich, aber ohne asList())
+       ============================================================== */
+    private static final class TimeSigmoidCalibrator {
+
+        /* --- Container ------------------------------------------- */
+        static class Model{
+            double[] p; double med; double iqr;
+        }
+
+        /* --- statische Daten ------------------------------------- */
+        private static final List<Integer> TIME_GRID = new ArrayList<>();
+        private static final List<String>  GROUPS    = Arrays.asList("A","D","E");
+        private static final Map<String,Map<Integer,Model>> MODEL_MAP = new HashMap<>();
+
+        static { load("/sigmoid_global_v11.2.json"); }
+
+        /* ---- JSON‑Loader --------------------------------------- */
+        private static void load(String res){
+            try(InputStream in = TimeSigmoidCalibrator.class.getResourceAsStream(res)){
+                if (in==null) throw new RuntimeException("Model file not found: "+res);
+                JsonObject root = JsonParser.parseReader(
+                        new InputStreamReader(in, StandardCharsets.UTF_8)).getAsJsonObject();
+
+                /* Basis‑Parameter */
+                double[] base = new double[]{
+                        root.getAsJsonObject("params").get("b0").getAsDouble(),
+                        root.getAsJsonObject("params").get("b1").getAsDouble(),
+                        root.getAsJsonObject("params").get("k") .getAsDouble(),
+                        root.getAsJsonObject("params").get("x0").getAsDouble()
+                };
+
+                /* Median / IQR A  + Zeitgitter --------------------- */
+                List<Double> medA = new ArrayList<>();
+                for(JsonElement e: root.getAsJsonArray("med_A")) medA.add(e.getAsDouble());
+                List<Double> iqrA = new ArrayList<>();
+                for(JsonElement e: root.getAsJsonArray("iqr_A")) iqrA.add(e.getAsDouble());
+                for(JsonElement e: root.getAsJsonArray("time_grid")) TIME_GRID.add(e.getAsInt());
+
+                /* Δ‑Verschiebungen je Gruppe ----------------------- */
+                JsonArray deltaArr = root.getAsJsonArray("Δ");
+
+                for(int g=0; g<GROUPS.size(); g++){
+                    String grp = GROUPS.get(g);
+                    JsonArray deltaGrp = deltaArr.get(g).getAsJsonArray();
+                    Map<Integer,Model> map = new HashMap<>();
+
+                    int len = Math.min(Math.min(medA.size(), iqrA.size()), TIME_GRID.size());
+                    for(int t=0; t<len && t<deltaGrp.size(); t++){
+                        Model m = new Model();
+                        m.p   = base.clone();
+                        m.p[0]+= deltaGrp.get(t).getAsDouble();   // nur b0 verschieben
+                        m.med = medA.get(t);
+                        m.iqr = iqrA.get(t);
+                        map.put(TIME_GRID.get(t), m);
+                    }
+                    MODEL_MAP.put(grp, map);
+                }
+            }catch(Exception e){
+                IJ.log("[SigmoidCalibrator] Error loading model: "+e);
+            }
+        }
+
+        /* ---- Anwendung ----------------------------------------- */
+        static double apply(double raw,int timeH,String grp){
+
+            Integer closest = TIME_GRID.stream()
+                    .min(Comparator.comparingInt(t -> Math.abs(t-timeH)))
+                    .orElse(null);
+            if (closest==null) return raw;
+
+            Model m = MODEL_MAP
+                    .getOrDefault(grp, Collections.emptyMap())
+                    .get(closest);
+            if (m==null || m.iqr==0.0) return raw;
+
+            double z   = (raw - m.med) / m.iqr;
+            double arg = -m.p[2] * (z - m.p[3]);
+            arg = Math.max(Math.min(arg,700.0), -700.0);   // numerisch stabil
+            return m.p[0] + m.p[1] / (1.0 + Math.exp(arg));
+        }
+    }
+}
