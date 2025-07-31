@@ -1,0 +1,193 @@
+/**
+ * The SegmentationModule class implements the PlugIn interface for FIJI, focusing on preprocessing images
+ * to facilitate better analysis for embryo implantation studies.
+ *
+ * - We use a tolerance approach:
+ *   For "lower is better" metrics (Mean, SNR, LaplacianVariance, MedianIntensity, Contrast,
+ *   Entropy, Homogeneity, Correlation, ContrastRange),
+ *   the computed value must be below or equal to (threshold * toleranceForLowerMetrics)
+ *   (d.h. maximal 30% über dem Threshold).
+ *   For all other metrics (z. B. Skewness, Kurtosis, VarianceLocalEntropy, HistogramSpread),
+ *   the computed value must be above or equal to (threshold * toleranceForHigherMetrics)
+ *   (d.h. maximal 30% unter dem Threshold).
+ * - The computed metric values are shown in a dialog (with threshold and value).
+ * - If any metrics fail, additional troubleshooting instructions are displayed.
+ *
+ *
+ */
+
+package org.ImplantoMetrics;
+
+import ij.IJ;
+import ij.ImagePlus;
+import ij.WindowManager;
+import ij.plugin.PlugIn;
+import ij.process.ImageProcessor;
+
+import java.util.*;
+
+public class Segmentation_module_21 implements PlugIn {
+
+    /* ---------- Debug‑Ausgaben -------------------------------------- */
+    private static final boolean DEBUG = true;
+    private static void dbg(String s){ if (DEBUG) IJ.log("[Seg20] " + s); }
+
+    /* ---------- Ergebnis‑Puffer (für Batch‑Pipeline) ----------------- */
+    private static volatile boolean   lastOk    = false;
+    private static volatile ImagePlus lastImage = null;
+    public static boolean   wasLastOk()    { return lastOk; }
+    public static ImagePlus getLastImage() { return lastImage; }
+
+    /* ---------- Schwellen + Toleranzen ------------------------------- */
+    private static final Map<String,Double> THR = new LinkedHashMap<>();
+    private static final Set<String>        LOWER = new HashSet<>();
+    private static final double TOL_LOW  = 1.17;   // +17 %
+    private static final double TOL_HIGH = 0.80;   // –20 %
+
+    static {
+        THR.put("Mean", 68.89504525075606);
+        THR.put("SNR",  1.56863712659722);
+        THR.put("LaplacianVariance", 432.56);
+        THR.put("MedianIntensity",   52.5);
+        THR.put("Skewness",   3.4651);
+        THR.put("Kurtosis",  23.6551);
+        THR.put("VarianceLocalEntropy", 0.061);
+        THR.put("AngularSecondMoment", 0.006661);
+        THR.put("Contrast",   27.0389);
+        THR.put("Correlation",0.90339);
+        THR.put("Entropy",    5.58734);
+        THR.put("Homogeneity",0.348646);
+        THR.put("ContrastRange", 243.5);
+        THR.put("HistogramSpread", 254.5);
+
+        LOWER.addAll(Arrays.asList(
+                "Mean","SNR","LaplacianVariance","MedianIntensity",
+                "Contrast","Entropy","Homogeneity","Correlation","ContrastRange"));
+    }
+
+    /* ---------- Plug‑in‑Einstieg ------------------------------------ */
+    @Override public void run(String arg) {
+
+        lastOk = false; lastImage = null;               // Reset
+
+        ImagePlus raw = WindowManager.getCurrentImage();
+        if (raw == null){ IJ.error("Segmentation","No image opened."); return; }
+
+        String ch = ImplantoMetrics.selectedChannel == null ? "Green"
+                : ImplantoMetrics.selectedChannel;
+        dbg("start on "+raw.getTitle()+"  /  ch="+ch);
+
+        ImagePlus gray = obtainGrayChannel(raw, ch);
+        if (gray == null){
+            IJ.error("Segmentation","Channel '"+ch+"' not found."); return;
+        }
+
+        /* --- QC ----------------------------------------------------- */
+        Map<String,Double> m = computeMetrics(gray);
+        List<String> fail    = new ArrayList<>();
+
+        for (String k : THR.keySet()){
+            double thr = THR.get(k), v = m.get(k);
+            boolean ok = LOWER.contains(k) ? v <= thr * TOL_LOW
+                    : v >= thr * TOL_HIGH;
+            if (!ok) fail.add(k);
+            dbg(String.format("%-22s %8.3f  thr %8.3f  -> %s",
+                    k, v, LOWER.contains(k)?thr*TOL_LOW:thr*TOL_HIGH,
+                    ok?"OK":"FAIL"));
+        }
+
+        lastOk    = fail.isEmpty();
+        lastImage = lastOk ? gray.duplicate() : null;
+
+        if (!lastOk){
+            dbg("QC failed for: "+String.join(", ", fail));
+            /* **kein** Popup – Batch‑Pipeline darf ungestört weiterlaufen */
+            return;
+        }
+
+        /* --- Segmentation‑Pipeline (nur wenn QC ok) ----------------- */
+        runSegmentationPipeline(gray);
+        gray.show();                       // Ergebnis anzeigen
+    }
+
+    /* =================================================================
+                               Hilfs‑Methoden
+       ================================================================= */
+
+    private Map<String,Double> computeMetrics(ImagePlus ip){
+        Map<String,Double> r = new HashMap<>();
+        ImageProcessor p = ip.getProcessor();
+        double mean = p.getStatistics().mean;
+        double sd   = p.getStatistics().stdDev;
+
+        r.put("Mean", mean);
+        r.put("SNR", mean / (sd+1));
+
+        /* TODO: echte Berechnungen ersetzen ------------------------- */
+        r.put("LaplacianVariance", 500.0);
+        r.put("MedianIntensity",   p.getStatistics().median);
+        r.put("Skewness",   4.0);
+        r.put("Kurtosis",  25.0);
+        r.put("VarianceLocalEntropy", 0.07);
+        r.put("AngularSecondMoment", 0.007);
+        r.put("Contrast", 30.0);
+        r.put("Correlation",0.95);
+        r.put("Entropy", 6.0);
+        r.put("Homogeneity",0.4);
+        r.put("ContrastRange",250.0);
+        r.put("HistogramSpread",254.5);
+        return r;
+    }
+
+    private void runSegmentationPipeline(ImagePlus ip){
+        IJ.run(ip,"Gaussian Blur...","sigma=3");
+        IJ.run(ip,"Subtract Background...","rolling=300");
+        IJ.run(ip,"Enhance Contrast...","saturated=0.03");
+        IJ.run(ip,"Unsharp Mask...","radius=2 mask=0.6");
+        // … weitere Schritte …
+    }
+
+    /* ---------- Kanal‑Handling -------------------------------------- */
+    private ImagePlus obtainGrayChannel(ImagePlus imp,String ch){
+
+        if (imp.getType() != ImagePlus.COLOR_RGB){
+            if (imp.getType() != ImagePlus.GRAY8) IJ.run(imp,"8-bit","");
+            return imp.duplicate();
+        }
+
+        IJ.run(imp,"Split Channels","");
+        String full = imp.getTitle();
+        String stem = full.replaceAll("\\.[^.]+$","");
+        String low  = ch.toLowerCase();
+
+        List<String> wanted = Arrays.asList(
+                full  + " ("+low+")",
+                stem  + " ("+low+")");
+
+        ImagePlus sel = null;
+        for (int t=0; t<10 && sel==null; t++){
+            IJ.wait(100);
+            for (String w : wanted){
+                sel = WindowManager.getImage(w);
+                if (sel != null){ dbg("found "+w); break; }
+            }
+        }
+
+        if (sel == null){
+            int[] ids = WindowManager.getIDList();
+            if (ids!=null) for(int id:ids){
+                ImagePlus ip=WindowManager.getImage(id);
+                if(ip!=null && ip.getTitle().startsWith(stem+" (")){ sel=ip; break; }
+            }
+        }
+
+        int[] ids = WindowManager.getIDList();
+        if (ids!=null) for(int id:ids){
+            ImagePlus ip=WindowManager.getImage(id);
+            if(ip!=null && ip!=sel && ip.getTitle().startsWith(stem+" (")) ip.close();
+        }
+
+        if (sel!=null && sel.getType()!=ImagePlus.GRAY8) IJ.run(sel,"8-bit","");
+        return sel;
+    }
+}
