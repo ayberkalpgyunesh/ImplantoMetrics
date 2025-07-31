@@ -1,4 +1,3 @@
-ImplantoMetrics Plugin
 Introduction
 ImplantoMetrics is a comprehensive plugin for Fiji (an ImageJ distribution), specifically designed to facilitate the quantitative analysis of implantation processes using a 3D in vitro model. The plugin leverages advanced image processing, machine learning algorithms, and statistical methods to offer deep insights into embryo implantation and related biological processes, such as cancer research.
 
