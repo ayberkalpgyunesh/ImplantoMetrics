@@ -1,0 +1,71 @@
+
+package org.ImplantoMetrics;
+
+
+/*
+ * The BinaryModule class implements the PlugIn interface for FIJI, dedicated to processing images
+ * into binary form. This is particularly useful in various image analysis tasks where binary
+ * segmentation is required.
+ */
+
+
+
+
+/* ---------- ImageJ ---------------- */
+import ij.IJ;
+import ij.ImagePlus;
+import ij.plugin.PlugIn;
+import ij.process.ImageProcessor;
+
+@SuppressWarnings("unused")
+public class BinaryModul_5 implements PlugIn {
+
+    /* ---------- Debug --------------------------- */
+    private static final boolean DEBUG = false;
+    private static void dbg(String s){ if (DEBUG) IJ.log("[Binary] "+s); }
+
+    /* ---------- letzte erzeugte Maske ----------- */
+    private static volatile ImagePlus lastMask = null;
+    public  static ImagePlus getLastImage() { return lastMask; }
+
+    /* ============================================ */
+    @Override public void run(String arg) {
+
+        ImagePlus src = IJ.getImage();
+        if (src == null){
+            IJ.error("Binary", "No image open."); return;
+        }
+        dbg("Source = " + src.getTitle());
+
+        /* --- Arbeitskopie erstellen -------------- */
+        ImagePlus img = src.duplicate();
+        img.setTitle(src.getTitle() + "_BIN");
+
+        /* --- Graustufe erzwingen ----------------- */
+        if (img.getType() != ImagePlus.GRAY8) {
+            IJ.run(img, "8-bit", "");
+            dbg("Converted to 8‑bit.");
+        }
+
+        /* --- Vorverarbeitung + Threshold --------- */
+        IJ.run(img, "Enhance Contrast", "saturated=0.35");
+        IJ.run(img, "Auto Local Threshold",
+                "method=Phansalkar radius=500 parameter_1=0 parameter_2=0 white");
+
+        /* --- Löcher füllen + leichte Glättung ---- */
+        IJ.run(img, "Fill Holes", "");
+        IJ.run(img, "Erode",  "stack");
+        IJ.run(img, "Dilate", "stack");
+
+        /* --- 0/255‑Maske sicherstellen ------------ */
+        IJ.run(img, "Convert to Mask", "");
+        img.getProcessor().setThreshold(255, 255, ImageProcessor.NO_LUT_UPDATE);
+        img.updateAndDraw();
+
+        /* --- Ergebnis bereitstellen -------------- */
+        img.changes = false;            // KEIN „Save changes?“‑Dialog
+        lastMask    = img;
+        img.show();
+        dbg("Mask stored & displayed.");
+    }
+}
