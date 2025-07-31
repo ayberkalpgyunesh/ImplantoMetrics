@@ -1,0 +1,200 @@
+
+/**
+ * ImplantoMetrics Plugin for FIJI
+
+ * This FIJI plugin, ImplantoMetrics, is designed to enhance the analysis of embryo implantation
+ * by providing a suite of tools for segmentation, binary module processing, and visualization
+ * of implantation data. The main features include color channel selection for image analysis,
+ * modules for segmentation and binary processing to facilitate image analysis, and a variety of
+ * visualization tools such as projections, thickness analysis, and a 3D viewer to assist researchers
+ * in studying the implantation process more effectively. The plugin supports green, red, and blue color
+ * channels to accommodate different staining techniques used in microscopy images related to embryo
+ * implantation studies.
+
+ * Developed by Ayberk Alp Gyunesh
+
+ * This method initializes the GUI for the ImplantoMetrics plugin, providing an interactive
+ * and user-friendly interface. Users are presented with a variety of buttons that allow them
+ * to access different modules of the plugin, each tailored for specific aspects of implantation
+ * analysis.
+
+ * The interface includes:
+ * - A color channel selection drop-down to adapt the analysis to images captured in different
+ *   color channels (Red, Green, Blue), enhancing flexibility in processing diverse image datasets.
+ * - Segmentation Module: For preprocessing images to isolate the regions of interest, facilitating
+ *   a more focused analysis.
+ * - Binary Module: Converts images into binary format for further analysis, crucial for
+ *   segmentation and feature extraction.
+ * - Projections, Thickness, and 3D Viewer buttons: These visualization tools offer users the
+ *   ability to examine the data in various formats, providing insights into the spatial
+ *   distribution and physical characteristics of the sample.
+ * - Parameter and Invasion Factor buttons: These features allow for the quantitative
+ *   analysis of the images, assessing various parameters and computing the invasion factor
+ *   which is pivotal for evaluating the success of implantation.
+ *
+ * Note: Ensure that the FIJI software is updated to the latest version for optimal compatibility
+ * and performance of the ImplantoMetrics plugin.
+ */
+
+
+package org.ImplantoMetrics;
+
+import ij.IJ;
+import ij.plugin.PlugIn;
+
+import javax.swing.*;
+import java.awt.*;
+import java.lang.reflect.InvocationTargetException;
+import java.util.Map;
+
+public class ImplantoMetrics implements PlugIn {
+
+    public static String selectedChannel = "Green";
+
+    @Override
+    public void run(String arg) {
+        SwingUtilities.invokeLater(this::createAndShowGUI);
+    }
+
+    /* ---------- GUI ---------- */
+    private void createAndShowGUI() {
+
+        JFrame frame = new JFrame("ImplantoMetrics");
+        frame.setSize(600, 600);
+        frame.setLayout(new BorderLayout(10, 10));
+        ((JComponent) frame.getContentPane())
+                .setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+
+        /* ---------- Kanalwahl ---------- */
+        JPanel topPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        topPanel.add(new JLabel("Choose Color Channel:"));
+        JComboBox<String> channelComboBox =
+                new JComboBox<>(new String[]{"Red", "Green", "Blue"});
+        channelComboBox.setSelectedItem(selectedChannel);
+        channelComboBox.addActionListener(e ->
+                selectedChannel = (String) channelComboBox.getSelectedItem());
+        topPanel.add(channelComboBox);
+        frame.add(topPanel, BorderLayout.NORTH);
+
+        /* ---------- Buttons links ---------- */
+        JButton segmentationButton =
+                smallWhiteButton("<html><center>Segmentation<br>Module</center></html>");
+        segmentationButton.addActionListener(e ->
+                launchIJ1("org.ImplantoMetrics.Segmentation_module_21"));
+
+        JButton binaryButton =
+                smallWhiteButton("<html><center>Binary<br>Module</center></html>");
+        binaryButton.addActionListener(e ->
+                launchIJ1("org.ImplantoMetrics.BinaryModul_5"));
+
+        JPanel leftPanel = new JPanel();
+        leftPanel.setLayout(new BoxLayout(leftPanel, BoxLayout.Y_AXIS));
+        leftPanel.add(segmentationButton);
+        leftPanel.add(Box.createRigidArea(new Dimension(0, 10)));
+        leftPanel.add(binaryButton);
+
+        /* ---------- Mitte: Batch‑Button ---------- */
+        JButton batchBtn = new JButton("Batch Mode");
+        batchBtn.setPreferredSize(new Dimension(120, 240));
+        batchBtn.setMaximumSize(new Dimension(120, 240));
+        batchBtn.setBackground(new Color(0, 102, 204));
+        batchBtn.setForeground(Color.WHITE);
+        batchBtn.setFont(new Font("Arial", Font.BOLD, 14));
+        batchBtn.addActionListener(e ->
+                launchIJ1("org.ImplantoMetrics.BatchRAnoMamp"));
+
+        /* ---------- Container: Links + Mitte ---------- */
+        JPanel centerContainer = new JPanel();
+        centerContainer.setLayout(new BoxLayout(centerContainer, BoxLayout.X_AXIS));
+        centerContainer.add(leftPanel);
+        centerContainer.add(Box.createRigidArea(new Dimension(10, 0)));
+        centerContainer.add(batchBtn);
+        centerContainer.add(Box.createHorizontalGlue());
+
+        frame.add(centerContainer, BorderLayout.CENTER);
+
+        /* ---------- Rechts: Visualisation ---------- */
+        JPanel visPanel = new JPanel(new GridLayout(3, 1, 5, 5));
+        visPanel.setBorder(BorderFactory.createTitledBorder("Visualisation"));
+
+        JButton projectionsButton = smallWhiteButton("Projections");
+        projectionsButton.addActionListener(e ->
+                launchIJ1("org.ImplantoMetrics.ProjectionModul"));
+        visPanel.add(projectionsButton);
+
+        JButton thicknessButton = smallWhiteButton("Thickness");
+        thicknessButton.addActionListener(e ->
+                launchIJ1("org.ImplantoMetrics.ThicknessModul"));
+        visPanel.add(thicknessButton);
+
+        JButton viewer3DButton = smallWhiteButton("3D Viewer");
+        viewer3DButton.addActionListener(e ->
+                launchIJ1("org.ImplantoMetrics.D3Viewer"));
+        visPanel.add(viewer3DButton);
+
+        frame.add(visPanel, BorderLayout.EAST);
+
+        /* ---------- Unten: Parameter + Invasion Factor ---------- */
+        JButton parameterBtn = styledPurpleButton("Parameter");
+        parameterBtn.addActionListener(e -> {
+            launchIJ1("org.ImplantoMetrics.ParameterButonom");
+            Map<String, Float> results = RenderModulen.getLastResults();
+        });
+
+        JButton invasionBtn = styledPurpleButton("Invasion Factor");
+        invasionBtn.addActionListener(e ->
+                launchIJ1("org.ImplantoMetrics.IF_module_48"));
+
+        JPanel southPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        southPanel.add(parameterBtn);
+        southPanel.add(invasionBtn);
+        frame.add(southPanel, BorderLayout.SOUTH);
+
+        frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
+        frame.setVisible(true);
+    }
+
+    /* ---------- Helper ---------- */
+    private static JButton styledPurpleButton(String text) {
+        JButton b = new JButton(text);
+        b.setBackground(new Color(128, 0, 128));
+        b.setForeground(Color.WHITE);
+        b.setFont(new Font("Arial", Font.BOLD, 16));
+        b.setPreferredSize(new Dimension(200, 60));
+        b.setBorderPainted(false);
+        b.setOpaque(true);
+        return b;
+    }
+
+    private static JButton smallWhiteButton(String text) {
+        JButton b = new JButton(text);
+        b.setPreferredSize(new Dimension(200, 120));
+        b.setMaximumSize(new Dimension(200, 120));
+        b.setFont(new Font("Arial", Font.BOLD, 18));
+        return b;
+    }
+
+    /** Lädt und führt ein klassisches ImageJ‑1‑Plug‑in per Reflection aus. */
+    private static void launchIJ1(String className) {
+        try {
+            Class<?> cls = Class.forName(className);
+            ((PlugIn) cls.getDeclaredConstructor().newInstance()).run("");
+        } catch (ClassNotFoundException | InstantiationException |
+                 IllegalAccessException | NoSuchMethodException |
+                 InvocationTargetException ex) {
+            IJ.log("Error loading or starting module '" + className + "': " + ex.getMessage());
+        }
+    }
+
+    /* ---------- Für Stand‑alone‑Test ---------- */
+    public static void main(String[] args) {
+        new ImplantoMetrics().run("");
+    }
+}
+
+
+
+    public static void main(String[] args) {
+        new ImplantoMetrics().run("");
+    }
+}
