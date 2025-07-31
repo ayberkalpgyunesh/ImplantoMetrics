@@ -1,0 +1,16 @@
+Hyperparameter,Wert
+learning_rate,0.001397555300755155
+epochs,70
+num_layers,1
+units_0,256
+units_1,512
+units_2,1024
+units_3,1024
+units_4,128
+units_5,512
+units_6,512
+activation,relu
+l1,1.1443567764144847e-06
+l2,0.002322223736550132
+dropout,False
+dropout_rate,0.397519454462482
