@@ -1,0 +1,305 @@
+/*  ImplantoMetrics – Batch-Runner (Parameter / Invasion)  */
+package org.ImplantoMetrics;
+
+import ij.IJ;
+import ij.ImagePlus;
+import ij.WindowManager;
+import ij.gui.GenericDialog;
+import ij.plugin.PlugIn;
+
+import javax.swing.*;
+import java.awt.BorderLayout;
+import java.io.File;
+import java.io.PrintWriter;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@SuppressWarnings("unused")
+public class BatchRAnoMamp implements PlugIn {
+
+    /* ---------- Debug ------------------------------------------------ */
+    private static final boolean DEBUG = true;
+    private static void log(String msg){ if (DEBUG) IJ.log("[Batch] "+msg); }
+
+    /* ---------- Modul-Klassen ---------------------------------------- */
+    private static final String SEG = "org.ImplantoMetrics.Segmentation_module_21";
+    private static final String BIN = "org.ImplantoMetrics.BinaryModul_4";
+    private static final String PAR = "org.ImplantoMetrics.ParameterButonom";
+    private static final String IFM = "org.ImplantoMetrics.IF_module_48";   // <- vereinheitlicht
+
+    /* ---------- h-Regex („…_12.tif“) --------------------------------- */
+    private static final Pattern HOUR_RE =
+            Pattern.compile("[-_](\\d+)\\.tif{1,2}$", Pattern.CASE_INSENSITIVE);
+
+    /* ---------- Optionen / Status ----------------------------------- */
+    private File   inDir, outDir;
+    private String channel = "Green";
+    private int    stepH   = 0;            // 0 = alle Bilder, Zeitdialog im IF-Modul
+    private boolean saveBin = false;
+
+    private enum Mode { PARAMETER, INVASION }
+    private Mode mode = Mode.PARAMETER;
+
+    private final List<String> allLines = new ArrayList<>();
+    private volatile Progress gui;        // wird auf EDT erzeugt
+
+    /* ---------- Zeit-Zähler für IF (Modus INVASION) ------------------ */
+    private int ifCounter = 0;            // 0, N, 2N, …
+
+    /* =============================================================== */
+    @Override public void run(String arg) {
+
+        /* 1 – Dialog */
+        if (!showDialog()) return;
+
+        /* 2 – kleines GUI auf EDT anlegen */
+        if (SwingUtilities.isEventDispatchThread())
+            gui = new Progress();
+        else
+            SwingUtilities.invokeLater(() -> gui = new Progress());
+
+        /* 3 – Batch-Thread starten */
+        new Thread(this::loop, "Batch-Thread").start();
+    }
+
+    /* ---------------- Dialog --------------------------------------- */
+    private boolean showDialog(){
+        GenericDialog gd = new GenericDialog("Batch parameters");
+
+        gd.addMessage("Choose analysis mode (exactly one):");
+        gd.addCheckbox("Parameter (only)", true);
+        gd.addCheckbox("Invasion Factor",  false);
+
+        gd.addChoice("Color channel", new String[]{"Red","Green","Blue"}, channel);
+        gd.addDirectoryField("Input folder",  "");
+        gd.addDirectoryField("Output folder", "");
+        gd.addNumericField ("Process every N hours (0 = all)", 0, 0);
+        gd.addCheckbox("Save BIN images", false);
+
+        gd.showDialog();
+        if (gd.wasCanceled()) return false;
+
+        boolean p = gd.getNextBoolean();
+        boolean i = gd.getNextBoolean();
+        if (!(p ^ i)){ IJ.error("Choose exactly *one* mode."); return false; }
+
+        mode     = p ? Mode.PARAMETER : Mode.INVASION;
+        channel  = gd.getNextChoice();
+        inDir    = new File(gd.getNextString());
+        outDir   = new File(gd.getNextString());
+        stepH    = (int) gd.getNextNumber();
+        saveBin  = gd.getNextBoolean();
+
+        return true;
+    }
+
+    /* ---------------- Haupt-Loop ---------------------------------- */
+    private void loop(){
+
+        if (!inDir.isDirectory()){ IJ.error("Input folder invalid."); return; }
+        if (!outDir.exists() && !outDir.mkdirs()){
+            IJ.error("Cannot create output folder."); return;
+        }
+        log("Mode="+mode+"  Ch="+channel+"  saveBin="+saveBin+"  stepH="+stepH);
+
+        File[] files = inDir.listFiles((d,n)->n.toLowerCase().endsWith(".tif"));
+        if (files==null || files.length==0){ IJ.error("No *.tif found."); return; }
+        Arrays.sort(files, Comparator.comparingInt(this::hourOf));
+
+        int total = files.length, done = 0;
+
+        for (File f : files){
+            if (gui.cancelled()) break;
+
+            int h = hourOf(f);                       // -1 falls kein Suffix
+            if (stepH>0 && h % stepH != 0){
+                gui.update(++done,total,f.getName()+" (skip)"); continue;
+            }
+
+            ImagePlus raw = IJ.openImage(f.getAbsolutePath());
+            if (raw==null){
+                gui.update(++done,total,f.getName()+" (open err)"); continue;
+            }
+
+            ImplantoMetrics.selectedChannel = channel;
+            makeCurrent(raw);
+
+            /* ---------- 1 | Segmentation + QC ---------------------- */
+            if (!runPlugin(SEG)){
+                closeAll(); gui.update(++done,total,f.getName()+" (seg err)"); continue;
+            }
+            if (!Segmentation_module_21.wasLastOk()){
+                writeBadCsv(f.getName());
+                closeAll(); gui.update(++done,total,f.getName()+" (QC fail)"); continue;
+            }
+            ImagePlus seg = Segmentation_module_21.getLastImage();
+            if (seg==null){
+                closeAll(); gui.update(++done,total,f.getName()+" (null seg)"); continue;
+            }
+
+            /* ---------- 2 | Binary --------------------------------- */
+            ImagePlus bin = null;
+            if (runPlugin(BIN)) {
+                bin = BinaryModul_4.getLastImage();
+
+                if (saveBin && bin != null) {
+                    String outName = f.getName().replaceAll("(?i)\\.tif{1,2}$", "_BIN.tif");
+                    IJ.saveAsTiff(bin, new File(outDir, outName).getAbsolutePath());
+                }
+                if (!saveBin && bin != null) {
+                    bin.changes = false;
+                    bin.close();
+                    bin = null;
+                }
+            }
+
+            /* ---------- 3 | Parameter oder IF ----------------------- */
+            ImagePlus meas = (bin!=null)? bin : seg;
+            makeCurrent(meas);
+
+            if (mode==Mode.PARAMETER){
+
+                if (runPlugin(PAR)){
+                    Map<String,Float> vals =
+                            Optional.ofNullable(ParameterButonom.getLastResults())
+                                    .orElse(Collections.emptyMap());
+                    writeParamCsv(f.getName(), vals);
+                    collectParamLines(f.getName(), vals);
+                }
+
+            } else {                              // --- Invasion-Modus
+
+                /* a) Zeitwert setzen: 0, N, 2N … */
+                if (stepH > 0) {
+                    IF_module_48.setNextTime(ifCounter * stepH);
+                }
+                /* b) Plugin ausführen */
+                if (runPlugin(IFM)){
+                    double v = IF_module_48.getLastIF();
+                    writeIFCsv(f.getName(), v);
+                    allLines.add(f.getName()+","+v);
+                    ifCounter++;                  // nur bei Erfolg hochzählen
+                }
+            }
+
+            /* ---------- 4 | Cleanup + Fortschritt ------------------ */
+            closeAll();
+            gui.update(++done,total,f.getName());
+        }
+
+        /* ---------- Sammel-CSV ------------------------------------ */
+        writeAllCsv();
+
+        gui.close();
+        IJ.showMessage("Batch finished",
+                "Processed "+allLines.size()+" result lines.");
+    }
+
+    /* ---------------- Hilfs-Methoden ------------------------------ */
+    private int hourOf(File f){
+        Matcher m = HOUR_RE.matcher(f.getName());
+        return m.find()? Integer.parseInt(m.group(1)) : -1;
+    }
+
+    private void makeCurrent(ImagePlus imp){
+        if (imp==null) return;
+        try{
+            WindowManager.class
+                    .getMethod("setTempCurrentImage", ImagePlus.class)
+                    .invoke(null, imp);
+            return;
+        }catch(Throwable ignored){}
+
+        if (imp.getWindow()!=null){
+            SwingUtilities.invokeLater(
+                    () -> WindowManager.setCurrentWindow(imp.getWindow()));
+        }else{
+            SwingUtilities.invokeLater(() -> {
+                imp.show();
+                WindowManager.setCurrentWindow(imp.getWindow());
+            });
+        }
+    }
+
+    private boolean runPlugin(String cls){
+        try{
+            Class<?> c = Class.forName(cls);
+            ((PlugIn)c.getDeclaredConstructor().newInstance()).run("");
+            return true;
+        }catch(Exception e){ IJ.log("Error "+cls+": "+e); return false; }
+    }
+
+    private void closeAll(){
+        int[] ids = WindowManager.getIDList();
+        if(ids!=null) for(int id:ids){
+            ImagePlus ip = WindowManager.getImage(id);
+            if(ip!=null){ ip.changes=false; ip.close(); }
+        }
+    }
+
+    /* ---------- CSV Einzelfiles ---------------- */
+    private void writeBadCsv(String img){
+        writeFile(img.replace(".tif","_param.csv"),
+                "image,comment\n"+img+",bad segmentation\n");
+    }
+    private void writeParamCsv(String img, Map<String,Float> vals){
+        StringBuilder sb=new StringBuilder("image,parameter,value\n");
+        vals.forEach((k,v)-> sb.append(img).append(',').append(k)
+                .append(',').append(v).append('\n'));
+        writeFile(img.replace(".tif","_param.csv"), sb.toString());
+    }
+    private void writeIFCsv(String img,double v){
+        writeFile(img.replace(".tif","_IF.csv"),
+                "image,IF\n"+img+','+v+'\n');
+    }
+
+    /* ---------- Sammel-CSV -------------------- */
+    private void collectParamLines(String img, Map<String,Float> vals){
+        vals.forEach((k,v)-> allLines.add(img+','+k+','+v));
+    }
+    private void writeAllCsv(){
+        if (allLines.isEmpty()) return;
+        String name = (mode==Mode.PARAMETER)? "all_params.csv" : "all_IF.csv";
+        StringBuilder sb = new StringBuilder(
+                (mode==Mode.PARAMETER)? "image,parameter,value\n" : "image,IF\n");
+        allLines.forEach(l -> sb.append(l).append('\n'));
+        writeFile(name, sb.toString());
+    }
+
+    private void writeFile(String name,String txt){
+        try(PrintWriter pw=new PrintWriter(new File(outDir,name))){ pw.print(txt); }
+        catch(Exception e){ IJ.log("CSV write error: "+e); }
+    }
+
+    /* ---------- kleines Fortschritts-Fenster ----------------------- */
+    private static class Progress extends JFrame{
+        private final JProgressBar bar = new JProgressBar();
+        private final JLabel lbl      = new JLabel("Starting …");
+        private volatile boolean cancel=false;
+
+        Progress(){
+            super("Batch Progress");
+            setLayout(new BorderLayout(5,5));
+            bar.setStringPainted(true);
+            JButton stop = new JButton("Cancel");
+            stop.addActionListener(e -> cancel = true);
+
+            add(lbl,  BorderLayout.NORTH);
+            add(bar,  BorderLayout.CENTER);
+            add(stop, BorderLayout.SOUTH);
+
+            setSize(320,120);
+            setLocationRelativeTo(null);
+            setVisible(true);
+        }
+        void update(int done,int tot,String name){
+            bar.setMaximum(tot);
+            bar.setValue(done);
+            bar.setString(done+"/"+tot);
+            lbl.setText(name);
+        }
+        boolean cancelled(){ return cancel; }
+        void close(){ SwingUtilities.invokeLater(this::dispose); }
+    }
+}
